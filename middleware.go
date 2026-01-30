@@ -3,6 +3,8 @@ package cas
 import (
 	"context"
 	"net/http"
+	"net/url"
+	"strings"
 )
 
 // ContextKey is the type for context keys
@@ -64,10 +66,12 @@ func (m *Middleware) Handler(next http.Handler) http.Handler {
 		// Check for CAS ticket in URL
 		ticket := GetTicketFromRequest(r)
 		if ticket != "" {
-			user, err := m.client.ValidateTicket(ticket)
+			// Build the service URL for validation (current request URL without ticket)
+			serviceURL := buildServiceURL(r)
+			user, err := m.client.ValidateTicketWithService(ticket, serviceURL)
 			if err != nil {
-				// Ticket validation failed, redirect to login
-				m.client.RedirectToLogin(w, r)
+				// Ticket validation failed, redirect to login with current URL
+				redirectToLoginWithService(w, r, m.client, serviceURL)
 				return
 			}
 
@@ -80,13 +84,14 @@ func (m *Middleware) Handler(next http.Handler) http.Handler {
 			}
 
 			// Remove ticket from URL and redirect
-			cleanURL := removeTicketFromURL(r.URL.String())
+			cleanURL := RemoveTicketFromURL(r.URL)
 			http.Redirect(w, r, cleanURL, http.StatusFound)
 			return
 		}
 
-		// No session and no ticket, redirect to CAS login
-		m.client.RedirectToLogin(w, r)
+		// No session and no ticket, redirect to CAS login with current URL as service
+		serviceURL := buildServiceURL(r)
+		redirectToLoginWithService(w, r, m.client, serviceURL)
 	})
 }
 
@@ -103,49 +108,83 @@ func GetUserFromContext(ctx context.Context) *User {
 	return nil
 }
 
-// removeTicketFromURL removes the ticket parameter from URL
+// buildServiceURL builds the service URL from the current request
+func buildServiceURL(r *http.Request) string {
+	// Determine scheme
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	// Check X-Forwarded-Proto header (for reverse proxy)
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+
+	// Build URL without ticket parameter
+	u := &url.URL{
+		Scheme:   scheme,
+		Host:     r.Host,
+		Path:     r.URL.Path,
+		RawQuery: removeTicketParam(r.URL.RawQuery),
+	}
+
+	return u.String()
+}
+
+// redirectToLoginWithService redirects to CAS login with specific service URL
+func redirectToLoginWithService(w http.ResponseWriter, r *http.Request, client *Client, serviceURL string) {
+	loginURL := client.GetLoginURLForService(serviceURL)
+	http.Redirect(w, r, loginURL, http.StatusFound)
+}
+
+// RemoveTicketFromURL removes the ticket parameter from URL using proper URL parsing
+func RemoveTicketFromURL(u *url.URL) string {
+	// Create a copy to avoid modifying the original
+	result := &url.URL{
+		Scheme:   u.Scheme,
+		Host:     u.Host,
+		Path:     u.Path,
+		Fragment: u.Fragment,
+	}
+
+	// Remove ticket from query parameters
+	result.RawQuery = removeTicketParam(u.RawQuery)
+
+	return result.String()
+}
+
+// removeTicketParam removes the ticket parameter from query string
+func removeTicketParam(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery
+	}
+
+	values.Del("ticket")
+
+	return values.Encode()
+}
+
+// removeTicketFromURL is kept for backward compatibility (deprecated)
+// Deprecated: Use RemoveTicketFromURL instead
 func removeTicketFromURL(rawURL string) string {
-	// Simple implementation - in production, use proper URL parsing
-	if idx := indexOf(rawURL, "ticket="); idx != -1 {
-		// Find the start of ticket parameter
-		start := idx
-		if start > 0 && rawURL[start-1] == '&' {
-			start--
-		} else if start > 0 && rawURL[start-1] == '?' {
-			// Keep the '?' if ticket is the only parameter
-		}
-
-		// Find the end of ticket parameter
-		end := idx + 7 // len("ticket=")
-		for end < len(rawURL) && rawURL[end] != '&' {
-			end++
-		}
-		if end < len(rawURL) && rawURL[end] == '&' {
-			end++
-		}
-
-		// Remove the ticket parameter
-		result := rawURL[:start] + rawURL[end:]
-		// Clean up trailing ? or &
-		result = trimSuffix(result, "?")
-		result = trimSuffix(result, "&")
-		return result
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
 	}
-	return rawURL
-}
 
-func indexOf(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
-}
+	// Remove ticket parameter
+	q := u.Query()
+	q.Del("ticket")
+	u.RawQuery = q.Encode()
 
-func trimSuffix(s, suffix string) string {
-	if len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix {
-		return s[:len(s)-len(suffix)]
-	}
-	return s
+	// Clean up empty query string
+	result := u.String()
+	result = strings.TrimSuffix(result, "?")
+
+	return result
 }

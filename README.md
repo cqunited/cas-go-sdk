@@ -10,9 +10,10 @@
 - ✅ Proxy Ticket 验证
 - ✅ 单点登录 (SSO)
 - ✅ 单点登出 (SLO)
-- ✅ HTTP 中间件支持
-- ✅ 会话管理 (内存/Cookie)
+- ✅ HTTP 中间件支持（自动处理登录回调）
+- ✅ 会话管理 (内存/签名 Cookie)
 - ✅ 用户属性解析
+- ✅ 动态 Service URL 支持
 
 ## 安装
 
@@ -21,6 +22,8 @@ go get github.com/cqunited/cas-go-sdk
 ```
 
 ## 快速开始
+
+> TIPS: 为了解决 应用未注册 问题，可以通过修改本地 hosts，把已注册的域名（自行获取）解析到 127，即可完成功能验证
 
 ### 基本使用
 
@@ -39,7 +42,7 @@ func main() {
     // 创建 CAS 客户端
     client := cas.NewClient(
         "https://ids.example.com/authserver",  // CAS 服务器地址
-        "http://localhost:8080",                 // 本应用地址
+        "http://localhost:8080",               // 本应用地址
     )
 
     http.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
@@ -68,12 +71,20 @@ func main() {
 }
 ```
 
-### 使用中间件
+### 使用中间件（推荐）
+
+中间件会自动处理：
+- 检查用户会话
+- 重定向到 CAS 登录（保留原始请求 URL）
+- 验证 CAS ticket
+- 创建用户会话
+- 清理 URL 中的 ticket 参数
 
 ```go
 package main
 
 import (
+    "fmt"
     "net/http"
     
     cas "github.com/cqunited/cas-go-sdk"
@@ -125,6 +136,7 @@ client := cas.NewClient(casServerURL, serviceURL)
 
 // 获取登录 URL
 loginURL := client.GetLoginURL()
+loginURL := client.GetLoginURLForService(customServiceURL)  // 自定义 service URL
 loginURLWithRenew := client.GetLoginURLWithRenew()
 loginURLWithGateway := client.GetLoginURLWithGateway()
 
@@ -134,6 +146,7 @@ logoutURLWithService := client.GetLogoutURLWithService(redirectURL)
 
 // 验证 Ticket
 user, err := client.ValidateTicket(ticket)
+user, err := client.ValidateTicketWithService(ticket, serviceURL)  // 指定 service URL
 user, err := client.ValidateProxyTicket(ticket)
 user, err := client.ValidateSAMLTicket(ticket)
 
@@ -157,15 +170,15 @@ type User struct {
 
 SDK 提供两种会话存储实现：
 
-1. **MemorySessionStore** - 内存存储 (适合开发/测试)
-2. **CookieSessionStore** - Cookie 存储 (适合无状态应用)
+1. **MemorySessionStore** - 内存存储 (适合开发/测试/单实例部署)
+2. **CookieSessionStore** - 签名 Cookie 存储 (适合无状态应用/多实例部署)
 
 ```go
 // 内存存储
 store := cas.NewMemorySessionStore("session_name", 3600)
 
-// Cookie 存储
-store := cas.NewCookieSessionStore("session_name", 3600, "secret-key")
+// Cookie 存储 (使用 HMAC-SHA256 签名，防止篡改)
+store := cas.NewCookieSessionStore("session_name", 3600, "your-secret-key-at-least-32-bytes")
 ```
 
 你也可以实现自定义的 `SessionStore` 接口：
@@ -176,6 +189,25 @@ type SessionStore interface {
     Set(w http.ResponseWriter, r *http.Request, user *User) error
     Delete(w http.ResponseWriter, r *http.Request) error
 }
+```
+
+### Middleware
+
+```go
+// 创建中间件
+middleware := cas.NewMiddleware(client, sessionStore)
+
+// 配置忽略的路径（不需要认证）
+middleware.IgnorePaths = []string{"/", "/health", "/public"}
+
+// 包装 Handler
+http.Handle("/protected", middleware.Handler(yourHandler))
+
+// 或包装 HandlerFunc
+http.HandleFunc("/api", middleware.HandlerFunc(yourHandlerFunc))
+
+// 从 Context 获取用户
+user := cas.GetUserFromContext(r.Context())
 ```
 
 ## 配置说明
@@ -200,6 +232,10 @@ client.HTTPClient.Transport = &http.Transport{
     TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 }
 ```
+
+### 反向代理支持
+
+中间件自动支持 `X-Forwarded-Proto` 头，可以正确处理 HTTPS 反向代理场景。
 
 ## 与其他框架集成
 
@@ -236,17 +272,11 @@ func CASMiddleware(client *cas.Client, store cas.SessionStore) gin.HandlerFunc {
 }
 ```
 
-### Echo
+## 安全说明
 
-```go
-func CASMiddleware(client *cas.Client, store cas.SessionStore) echo.MiddlewareFunc {
-    return func(next echo.HandlerFunc) echo.HandlerFunc {
-        return func(c echo.Context) error {
-            // 类似实现...
-        }
-    }
-}
-```
+- **CookieSessionStore** 使用 HMAC-SHA256 签名保护 cookie 数据，防止客户端篡改
+- Cookie 默认设置 `HttpOnly`、`SameSite=Lax`，HTTPS 环境下自动设置 `Secure`
+- 建议在生产环境使用至少 32 字节的随机密钥
 
 ## 许可证
 

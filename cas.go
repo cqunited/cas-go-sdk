@@ -94,7 +94,12 @@ type AuthenticationFailure struct {
 
 // GetLoginURL returns the CAS login URL with service parameter
 func (c *Client) GetLoginURL() string {
-	return fmt.Sprintf("%s/login?service=%s", c.CASServerURLPrefix, url.QueryEscape(c.ServiceURL))
+	return c.GetLoginURLForService(c.ServiceURL)
+}
+
+// GetLoginURLForService returns the CAS login URL with a specific service URL
+func (c *Client) GetLoginURLForService(serviceURL string) string {
+	return fmt.Sprintf("%s/login?service=%s", c.CASServerURLPrefix, url.QueryEscape(serviceURL))
 }
 
 // GetLoginURLWithRenew returns the CAS login URL with renew parameter
@@ -119,6 +124,11 @@ func (c *Client) GetLogoutURLWithService(redirectURL string) string {
 
 // ValidateTicket validates a CAS ticket and returns user information
 func (c *Client) ValidateTicket(ticket string) (*User, error) {
+	return c.ValidateTicketWithService(ticket, c.ServiceURL)
+}
+
+// ValidateTicketWithService validates a CAS ticket with a specific service URL
+func (c *Client) ValidateTicketWithService(ticket, serviceURL string) (*User, error) {
 	if ticket == "" {
 		return nil, errors.New("ticket cannot be empty")
 	}
@@ -126,7 +136,7 @@ func (c *Client) ValidateTicket(ticket string) (*User, error) {
 	validateURL := fmt.Sprintf("%s/serviceValidate?ticket=%s&service=%s",
 		c.CASServerURLPrefix,
 		url.QueryEscape(ticket),
-		url.QueryEscape(c.ServiceURL))
+		url.QueryEscape(serviceURL))
 
 	resp, err := c.HTTPClient.Get(validateURL)
 	if err != nil {

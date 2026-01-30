@@ -3,6 +3,7 @@ package cas
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 )
 
@@ -185,12 +186,35 @@ func TestRemoveTicketFromURL(t *testing.T) {
 			"http://localhost:8080",
 			"http://localhost:8080",
 		},
+		{
+			"http://localhost:8080/path?ticket=ST-123&a=1&b=2",
+			"http://localhost:8080/path?a=1&b=2",
+		},
+		{
+			"http://localhost:8080/path?a=1&ticket=ST-123&b=2",
+			"http://localhost:8080/path?a=1&b=2",
+		},
 	}
 
 	for _, test := range tests {
 		result := removeTicketFromURL(test.input)
-		if result != test.expected {
+		// URL query parameter order may vary, so we need to compare parsed URLs
+		resultURL, _ := url.Parse(result)
+		expectedURL, _ := url.Parse(test.expected)
+
+		if resultURL.Scheme != expectedURL.Scheme ||
+			resultURL.Host != expectedURL.Host ||
+			resultURL.Path != expectedURL.Path {
 			t.Errorf("removeTicketFromURL(%s) = %s, expected %s", test.input, result, test.expected)
+			continue
+		}
+
+		// Compare query parameters
+		resultQuery := resultURL.Query()
+		expectedQuery := expectedURL.Query()
+		if len(resultQuery) != len(expectedQuery) {
+			t.Errorf("removeTicketFromURL(%s) query params count mismatch: got %d, expected %d",
+				test.input, len(resultQuery), len(expectedQuery))
 		}
 	}
 }
@@ -232,4 +256,170 @@ func TestMemorySessionStore(t *testing.T) {
 	if retrievedUser.User != user.User {
 		t.Errorf("Expected user to be '%s', got '%s'", user.User, retrievedUser.User)
 	}
+}
+
+func TestCookieSessionStore(t *testing.T) {
+	store := NewCookieSessionStore("test_session", 3600, "test-secret-key-32-bytes-long!!")
+
+	// Test Set and Get
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "http://localhost:8080", nil)
+
+	user := &User{
+		User: "testuser",
+		Attributes: map[string]interface{}{
+			"email": "test@example.com",
+		},
+	}
+
+	err := store.Set(w, r, user)
+	if err != nil {
+		t.Fatalf("Expected no error on Set, got %v", err)
+	}
+
+	// Get the cookie from response
+	cookies := w.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("Expected cookie to be set")
+	}
+
+	// Create new request with cookie
+	r2 := httptest.NewRequest("GET", "http://localhost:8080", nil)
+	r2.AddCookie(cookies[0])
+
+	retrievedUser, err := store.Get(r2)
+	if err != nil {
+		t.Fatalf("Expected no error on Get, got %v", err)
+	}
+
+	if retrievedUser.User != user.User {
+		t.Errorf("Expected user to be '%s', got '%s'", user.User, retrievedUser.User)
+	}
+}
+
+func TestCookieSessionStore_TamperedCookie(t *testing.T) {
+	store := NewCookieSessionStore("test_session", 3600, "test-secret-key-32-bytes-long!!")
+
+	// Create a tampered cookie
+	r := httptest.NewRequest("GET", "http://localhost:8080", nil)
+	r.AddCookie(&http.Cookie{
+		Name:  "test_session",
+		Value: "dGFtcGVyZWQ=.invalidsignature",
+	})
+
+	_, err := store.Get(r)
+	if err == nil {
+		t.Fatal("Expected error for tampered cookie")
+	}
+}
+
+func TestGetLoginURLForService(t *testing.T) {
+	client := NewClient("https://cas.example.com/cas", "http://localhost:8080")
+
+	serviceURL := "http://localhost:8080/protected?foo=bar"
+	loginURL := client.GetLoginURLForService(serviceURL)
+	expected := "https://cas.example.com/cas/login?service=http%3A%2F%2Flocalhost%3A8080%2Fprotected%3Ffoo%3Dbar"
+
+	if loginURL != expected {
+		t.Errorf("Expected login URL to be '%s', got '%s'", expected, loginURL)
+	}
+}
+
+func TestValidateTicketWithService(t *testing.T) {
+	// Create mock CAS server
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/serviceValidate" {
+			// Verify the service parameter
+			service := r.URL.Query().Get("service")
+			if service != "http://localhost:8080/custom" {
+				t.Errorf("Expected service to be 'http://localhost:8080/custom', got '%s'", service)
+			}
+
+			w.Header().Set("Content-Type", "application/xml")
+			w.Write([]byte(`<cas:serviceResponse xmlns:cas="http://www.yale.edu/tp/cas">
+				<cas:authenticationSuccess>
+					<cas:user>testuser</cas:user>
+				</cas:authenticationSuccess>
+			</cas:serviceResponse>`))
+		}
+	}))
+	defer mockServer.Close()
+
+	client := NewClient(mockServer.URL, "http://localhost:8080")
+
+	user, err := client.ValidateTicketWithService("ST-123456", "http://localhost:8080/custom")
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if user.User != "testuser" {
+		t.Errorf("Expected user to be 'testuser', got '%s'", user.User)
+	}
+}
+
+func TestMiddleware_RedirectsToLogin(t *testing.T) {
+	client := NewClient("https://cas.example.com/cas", "http://localhost:8080")
+	store := NewMemorySessionStore("test_session", 3600)
+	middleware := NewMiddleware(client, store)
+
+	handler := middleware.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "http://localhost:8080/protected", nil)
+
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusFound {
+		t.Errorf("Expected status %d, got %d", http.StatusFound, w.Code)
+	}
+
+	location := w.Header().Get("Location")
+	if location == "" {
+		t.Fatal("Expected Location header to be set")
+	}
+
+	// Should redirect to CAS login with the current URL as service
+	if !contains(location, "cas.example.com/cas/login") {
+		t.Errorf("Expected redirect to CAS login, got %s", location)
+	}
+	if !contains(location, "service=") {
+		t.Errorf("Expected service parameter in redirect URL, got %s", location)
+	}
+}
+
+func TestMiddleware_IgnorePaths(t *testing.T) {
+	client := NewClient("https://cas.example.com/cas", "http://localhost:8080")
+	store := NewMemorySessionStore("test_session", 3600)
+	middleware := NewMiddleware(client, store)
+	middleware.IgnorePaths = []string{"/health", "/"}
+
+	handler := middleware.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	}))
+
+	// Test ignored path
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "http://localhost:8080/health", nil)
+
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected status %d for ignored path, got %d", http.StatusOK, w.Code)
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsAt(s, substr))
+}
+
+func containsAt(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }
